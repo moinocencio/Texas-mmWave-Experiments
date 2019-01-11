@@ -34,13 +34,17 @@ I_HEART_RATE_EST_FFT = I_OUTPUT_FILTER_HEARTH_OUT + sizeFLOAT;
 I_HEART_RATE_EST_FFT_4HZ = I_HEART_RATE_EST_FFT + sizeFLOAT;
 I_HEART_EST_XCORR = I_HEART_RATE_EST_FFT_4HZ + sizeFLOAT;
 I_HEART_EST_PEAK_COUNT = I_HEART_EST_XCORR + sizeFLOAT;
+I_BREATHING_RATE_EST_FFT = I_HEART_EST_PEAK_COUNT + sizeFLOAT;
+I_BREATHING_RATE_EST_XCORR = I_BREATHING_RATE_EST_FFT + sizeFLOAT;
+I_BREATHING_RATE_EST_PEAK_COUNT = I_BREATHING_RATE_EST_XCORR + sizeFLOAT;
 
-I_MOTION_DETECTION_FLAG = I_MESSAGE_TLV_HEADER_2 - 2*sizeFLOAT - 1;
+I_MOTION_DETECTION_FLAG = I_BREATHING_RATE_EST_PEAK_COUNT + 8*sizeFLOAT;
+I_RESERVED = I_MOTION_DETECTION_FLAG + sizeFLOAT;
 
 %% Set Parameters
-userPort = 'COM5';
+userPort = '/dev/ttyACM1';
 userBaudRate = 115200;
-dataPort = 'COM6';
+dataPort = '/dev/ttyACM2';
 dataBaudRate = 921600;
 cfgFileName = 'xwr1642_profile_VitalSigns_20fps_Front.cfg';
 
@@ -48,14 +52,25 @@ cfgFileName = 'xwr1642_profile_VitalSigns_20fps_Front.cfg';
 delete(instrfind);
 user = serial(userPort,'BaudRate',userBaudRate);
 data = serial(dataPort,'BaudRate',dataBaudRate);
-data.InputBufferSize = 50000;
+data.InputBufferSize = 100000;
 
 %% Reading Initializations
-% numRangeBinProcessed = rangeEnd_Index - rangeStart_Index + 1;
 % Parameters
-packetSize = 300;               % Value large enough, doesn't matter how much
-packet = zeros(packetSize,1);   % Packet Initialization
+packetSize = I_MESSAGE_TLV_HEADER_2;               % Value large enough, doesn't matter how much
+packet = zeros(I_MESSAGE_TLV_HEADER_2,1);   % Packet Initialization
 xtime = 20;                     % Time in seconds to be displayed on the animated line
+saveData = 1;                   % Save Data for offline Reading
+
+if(saveData)
+    maxSaveSize = 1000;
+    nSaved = 1;
+    timeV = zeros(1,maxSaveSize);
+    phaseV = zeros(1,maxSaveSize);
+    BreathV = zeros(1,maxSaveSize);
+    HeartV = zeros(1,maxSaveSize);
+    BreathRV = zeros(1,maxSaveSize);
+    HeartRV = zeros(1,maxSaveSize);
+end
 
 % Plot Initialization
 figure(1)
@@ -63,6 +78,22 @@ subplot(3,1,1)
 title('Phase Unrwapped'),xlabel('t'),ylabel('phase')
 xlim([0 xtime]);
 h1 = animatedline;
+motionW = annotation('textbox', [0.92, 0.75, 0.1, 0.1]); 
+                     
+%figure(2)
+subplot(3,1,2)
+title('Filtered Breath Out'),xlabel('t'),ylabel('phase')
+xlim([0 xtime]);
+h2 = animatedline;
+bRateW = annotation('textbox', [0.92, 0.43, 0.1, 0.1]);
+
+%figure(3)
+subplot(3,1,3)
+title('Filtered Hearth Out'),xlabel('t'),ylabel('phase')
+xlim([0 xtime]);
+h3 = animatedline;
+hRateW = annotation('textbox', [0.92, 0.12, 0.1, 0.1]);
+
 Stop = uicontrol('Style', 'PushButton', ...
                          'String', 'Stop Sensor', ...
                          'Callback', @pushStopPressed,...
@@ -71,20 +102,8 @@ Clear = uicontrol('Style', 'PushButton', ...
                          'String', 'Clear points', ...
                          'Callback', {@pushClearPressed,h1},...
                          'Position',[100 20 60 20],...
-                         'DeleteFcn', 'delete(gcbf)');  
+                         'DeleteFcn', 'delete(gcbf)'); 
                      
-%figure(2)
-subplot(3,1,2)
-title('Filtered Breath Out'),xlabel('t'),ylabel('phase')
-xlim([0 xtime]);
-h2 = animatedline;
-
-%figure(3)
-subplot(3,1,3)
-title('Filtered Hearth Out'),xlabel('t'),ylabel('phase')
-xlim([0 xtime]);
-h3 = animatedline;
-
 global stopB
 stopB = 0;
 
@@ -115,53 +134,123 @@ for i = 1:nLines
     pause(0.5);
 end
 fclose(user);
-testHeader = zeros(1,40);
 
 %% Initiate Reading
 fopen(data);
-tic
-while(1)  
-    if(stopB)
-        StopSensor(data,user);
-        break;
+flushinput(data);
+if(saveData)
+    %% Save Data Cycle
+    tDisplay = tic;
+    tSave = tic;
+    while(1)
+        if(stopB)
+            StopSensor(data,user);
+            break;
+        end        
+        
+        b = fread(data,1,'uint8');      % Read Byte
+
+        if(b == MW(mwcount))  % Check for MAGIC_WORD        
+            mwcount = mwcount + 1;
+            if(mwcount == MAGIC_WORD + 1)         % MAGIC_WORD found: init package read
+                mwcount = 1;
+                for n = (MAGIC_WORD + 1):(packetSize)            % Read packetSize - MAGIC_WORD bytes
+                    packet(n) = fread(data,1,'char');                
+                end             
+                t = toc(tDisplay);
+                tS = toc(tSave);
+                if(t > xtime)
+                    tDisplay = tic;
+                    t = toc(tDisplay);
+                    clearpoints(h1);
+                    clearpoints(h2);
+                    clearpoints(h3);
+                    if(data.BytesAvailable == data.InputBufferSize)
+                        flushinput(data);
+                    end
+                end                                                
+                phase = double(typecast(swapbytes(uint8(packet(I_UNWRAP_PHASE_PEAK_MM:(I_OUTPUT_FILTER_BREATH_OUT - 1)))),'single'));
+                breath = double(typecast(swapbytes(uint8(packet(I_OUTPUT_FILTER_BREATH_OUT:(I_OUTPUT_FILTER_HEARTH_OUT - 1)))),'single'));
+                heart = double(typecast(swapbytes(uint8(packet(I_OUTPUT_FILTER_HEARTH_OUT:(I_HEART_RATE_EST_FFT - 1)))),'single'));
+                motion = typecast(swapbytes(uint8(packet(I_MOTION_DETECTION_FLAG:(I_RESERVED - 1)))),'single');
+                bRate = typecast(swapbytes(uint8(packet(I_BREATHING_RATE_EST_FFT:(I_BREATHING_RATE_EST_XCORR - 1)))),'single');
+                hRate = typecast(swapbytes(uint8(packet(I_HEART_RATE_EST_FFT:(I_HEART_RATE_EST_FFT_4HZ - 1)))),'single');
+                
+                addpoints(h1,t,phase);
+                addpoints(h2,t,breath);
+                addpoints(h3,t,heart);
+                
+                motionW.String = num2str(motion);           
+                bRateW.String = num2str(bRate,3);
+                hRateW.String = num2str(hRate,3);
+                drawnow
+                
+                timeV(nSaved) = tS;
+                phaseV(nSaved) = phase;
+                BreathV(nSaved) = breath;
+                HeartV(nSaved) = heart;
+                BreathRV(nSaved) = bRate;
+                HeartRV(nSaved) = hRate;
+                
+                nSaved = nSaved + 1;
+                
+                if(nSaved == maxSaveSize + 1)
+                    stopB = 1;
+                end
+                
+                disp(data.BytesAvailable);
+            end
+        else
+            mwcount = 1;
+        end   
     end
     
-    t = fread(data,1,'uint8');
+    save('VitalSignsData.mat', 'timeV', 'phaseV', 'BreathV', 'HeartV', 'BreathRV', 'HeartRV');
     
-    if(t == MW(mwcount))  % Check for MAGIC_WORD        
-        mwcount = mwcount + 1;
-        if(mwcount == MAGIC_WORD + 1)                       % MAGIC_WORD found: init package read
-            mwcount = 1;
-            for n = 9:(I_MESSAGE_TLV_HEADER_2+8)            % Read I_MESSAGE_TLV_HEADER_2 bytes
-                if(stopB)                    
-                    StopSensor(data,user);
-                    break;
-                end
-                packet(n) = fread(data,1,'char');                
-            end
-            axiscount = axiscount + 1;              
-            t = toc;
-            if(t > xtime)
-                tic
-                t = toc;
-                clearpoints(h1);
-                clearpoints(h2);
-                clearpoints(h3);
-            end
-            phase = double(typecast(swapbytes(uint8(packet(I_UNWRAP_PHASE_PEAK_MM:(I_OUTPUT_FILTER_BREATH_OUT - 1)))),'single'));
-            breath = double(typecast(swapbytes(uint8(packet(I_OUTPUT_FILTER_BREATH_OUT:(I_OUTPUT_FILTER_HEARTH_OUT - 1)))),'single'));
-            heart = double(typecast(swapbytes(uint8(packet(I_OUTPUT_FILTER_HEARTH_OUT:(I_HEART_RATE_EST_FFT - 1)))),'single'));
-            disp(double(typecast(swapbytes(uint8(packet(I_HEART_RATE_EST_FFT:(I_HEART_RATE_EST_FFT_4HZ - 1)))),'single')));
-            addpoints(h1,t,phase);
-            addpoints(h2,t,breath);
-            addpoints(h3,t,heart);
-            drawnow
+else
+    %% Don 't Save Data Cycle
+    tic
+    while(1)  
+        if(stopB)
+            StopSensor(data,user);
+            break;
         end
-    else
-        mwcount = 1;
-    end   
-end
+        
+        b = fread(data,1,'uint8');      % Read Byte
 
+        if(b == MW(mwcount))  % Check for MAGIC_WORD        
+            mwcount = mwcount + 1;
+            if(mwcount == MAGIC_WORD + 1)         % MAGIC_WORD found: init package read
+                mwcount = 1;
+                for n = (MAGIC_WORD + 1):(packetSize)            % Read packetSize - MAGIC_WORD bytes
+                    packet(n) = fread(data,1,'char');                
+                end             
+                t = toc;
+                if(t > xtime)
+                    tic
+                    t = toc;
+                    clearpoints(h1);
+                    clearpoints(h2);
+                    clearpoints(h3);
+                    
+                    if(data.BytesAvailable == data.InputBufferSize)
+                        flushinput(data);
+                    end
+                end                                                
+                addpoints(h1,t,double(typecast(swapbytes(uint8(packet(I_UNWRAP_PHASE_PEAK_MM:(I_OUTPUT_FILTER_BREATH_OUT - 1)))),'single')));
+                addpoints(h2,t,double(typecast(swapbytes(uint8(packet(I_OUTPUT_FILTER_BREATH_OUT:(I_OUTPUT_FILTER_HEARTH_OUT - 1)))),'single')));
+                addpoints(h3,t,double(typecast(swapbytes(uint8(packet(I_OUTPUT_FILTER_HEARTH_OUT:(I_HEART_RATE_EST_FFT - 1)))),'single')));
+                
+                motionW.String = num2str(typecast(swapbytes(uint8(packet(I_MOTION_DETECTION_FLAG:(I_RESERVED - 1)))),'single'));           
+                bRateW.String = num2str(typecast(swapbytes(uint8(packet(I_BREATHING_RATE_EST_FFT:(I_BREATHING_RATE_EST_XCORR - 1)))),'single'),3);
+                hRateW.String = num2str(typecast(swapbytes(uint8(packet(I_HEART_RATE_EST_FFT:(I_HEART_RATE_EST_FFT_4HZ - 1)))),'single'),3);
+                drawnow
+            end
+        else
+            mwcount = 1;
+        end   
+    end
+end
 
 %% Functions
 function pushClearPressed(~,~,h1)
